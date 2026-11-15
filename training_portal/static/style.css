@@ -137,6 +137,21 @@ input[type="file"] { width: 100%; padding: 8px; }
 
 .samples { margin-top: 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
+.search-card .search-form { margin: 6px 0 12px; }
+.search-input { flex: 2 1 320px; }
+.search-meta { color: var(--muted); font-size: 13px; margin: 4px 0 10px; }
+.search-meta strong { color: var(--ink); }
+.search-status { margin-top: 12px; display: flex; align-items: center; gap: 8px; }
+.search-flash form { display: inline; }
+.quote { max-width: 620px; line-height: 1.65; }
+.quote mark {
+  background: #3d3520;
+  color: #ffe8b0;
+  border-radius: 4px;
+  padding: 0 3px;
+}
+.pill-failed { color: #ffc2c6; border-color: #6a2f34; background: #2a1518; }
+
 .tablewrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 th, td {

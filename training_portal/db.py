@@ -126,7 +126,58 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Lifecycle of the FTS5 search index. There is only ever one row (id = 1).
+-- Search is served only while status = 'ready'; a failed build leaves the row
+-- in 'failed' and every search path reports "retrieval unavailable" instead of
+-- reading a partial index.
+CREATE TABLE IF NOT EXISTS search_index_state (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    status       TEXT NOT NULL CHECK (status IN
+                   ('building', 'ready', 'failed')),
+    indexed_rows INTEGER NOT NULL DEFAULT 0,
+    indexed_at   TEXT,
+    error        TEXT
+);
+
+INSERT OR IGNORE INTO search_index_state(id, status) VALUES (1, 'building');
 """
+
+# FTS5 external-content index over utterances. The trigram tokenizer treats the
+# text as overlapping 3-character groups, which gives substring matching for
+# continuous phrases of at least three characters in both Chinese and English
+# (the default unicode61 tokenizer emits a whole CJK run as one token and
+# cannot match phrases inside it). Column names must match the content table so
+# the external-content 'rebuild' and 'integrity-check' commands work.
+FTS_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS utterance_fts USING fts5(
+    text,
+    batch UNINDEXED,
+    respondent_id UNINDEXED,
+    tokenize = 'trigram',
+    content = 'utterances',
+    content_rowid = 'id'
+);
+
+CREATE TRIGGER IF NOT EXISTS utterances_ai AFTER INSERT ON utterances BEGIN
+    INSERT INTO utterance_fts(rowid, text, batch, respondent_id)
+    VALUES (new.id, new.text, new.batch, new.respondent_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS utterances_ad AFTER DELETE ON utterances BEGIN
+    INSERT INTO utterance_fts(utterance_fts, rowid, text, batch, respondent_id)
+    VALUES ('delete', old.id, old.text, old.batch, old.respondent_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS utterances_au AFTER UPDATE ON utterances BEGIN
+    INSERT INTO utterance_fts(utterance_fts, rowid, text, batch, respondent_id)
+    VALUES ('delete', old.id, old.text, old.batch, old.respondent_id);
+    INSERT INTO utterance_fts(rowid, text, batch, respondent_id)
+    VALUES (new.id, new.text, new.batch, new.respondent_id);
+END;
+"""
+
+FTS_TRIGGERS = ("utterances_ai", "utterances_ad", "utterances_au")
 
 DEFAULT_SETTINGS = {
     "pause_generation": "0",
@@ -173,6 +224,74 @@ class Database:
                 conn.execute(
                     "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
                     (key, value),
+                )
+
+    # -- FTS5 search index ----------------------------------------------
+    def fts_available(self) -> bool:
+        """True when the FTS5 virtual table and its sync triggers exist."""
+        with self.read() as conn:
+            tables = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'utterance_fts'"
+                )
+            }
+            if "utterance_fts" not in tables:
+                return False
+            triggers = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                )
+            }
+        return all(name in triggers for name in FTS_TRIGGERS)
+
+    def bootstrap_fts(self) -> None:
+        """Create the FTS5 table and sync triggers if the build supports it.
+
+        Raises ``sqlite3.Error`` when FTS5/the trigram tokenizer is unavailable;
+        the caller marks the search index as failed and the rest of the portal
+        keeps working without retrieval.
+        """
+        with self.transaction() as conn:
+            conn.executescript(FTS_DDL)
+
+    def get_search_state(self) -> dict[str, Any]:
+        with self.read() as conn:
+            row = conn.execute(
+                "SELECT status, indexed_rows, indexed_at, error "
+                "FROM search_index_state WHERE id = 1"
+            ).fetchone()
+        if row is None:
+            return {
+                "status": "building",
+                "indexed_rows": 0,
+                "indexed_at": None,
+                "error": None,
+            }
+        return dict(row)
+
+    def set_search_state(
+        self, status: str, indexed_rows: int = 0, error: str | None = None
+    ) -> None:
+        with self.transaction() as conn:
+            if status == "building":
+                conn.execute(
+                    "UPDATE search_index_state SET status = 'building', "
+                    "error = NULL WHERE id = 1"
+                )
+            elif status == "ready":
+                conn.execute(
+                    "UPDATE search_index_state SET status = 'ready', "
+                    "indexed_rows = ?, indexed_at = ?, error = NULL WHERE id = 1",
+                    (indexed_rows, utc_now()),
+                )
+            else:
+                conn.execute(
+                    "UPDATE search_index_state SET status = 'failed', "
+                    "error = ? WHERE id = 1",
+                    (error,),
                 )
 
     @contextmanager

@@ -11,6 +11,10 @@ services:
       PORTAL_PAUSE_GENERATION: "0"
       PORTAL_DELETE_FAILURES: "0"
       PORTAL_DELETE_ALWAYS_FAIL: "0"
+      # Set to "1" to force the FTS5 search-index build to fail, demonstrating
+      # the "retrieval unavailable -> restart/rebuild recovers" path. Leave "0"
+      # for normal operation; search is available as soon as the container boots.
+      PORTAL_FAIL_INDEX_BUILD: "0"
     volumes:
       - portal-data:/data
     restart: unless-stopped

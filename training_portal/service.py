@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import html
 import io
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -13,6 +15,10 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from .db import Database, utc_now
+
+MIN_QUERY_CHARS = 3
+MAX_QUERY_CHARS = 500
+SEARCH_LIMIT = 200
 
 BATCH_COLUMN = "batch"
 RESPONDENT_COLUMN = "respondent_id"
@@ -134,9 +140,266 @@ class Portal:
         self._wake = threading.Event()
         self._delete_lock = threading.Lock()
         self._publish_lock = threading.Lock()
+        self._index_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
+        self._init_search_index()
         self._recover_interrupted_jobs()
         self._sweep_orphans()
+
+    # ------------------------------------------------------------------
+    # FTS5 search index
+    # ------------------------------------------------------------------
+    def _init_search_index(self) -> None:
+        """Bootstrap the FTS5 index and reconcile it with the corpus.
+
+        The virtual table is created first; on a build whose SQLite lacks FTS5
+        or the trigram tokenizer the state row is marked ``failed`` and search
+        stays unavailable (the rest of the portal is unaffected). On a normal
+        boot the triggers keep the index transactionally aligned with
+        ``utterances``, so an initial backfill is only needed for a first run or
+        for an index left incomplete by a crashed/failed earlier build. A
+        successful build flips the state to ``ready`` and search reopens.
+        """
+        if not self.db.fts_available():
+            try:
+                self.db.bootstrap_fts()
+            except sqlite3.Error as exc:
+                self.db.set_search_state("failed", error=f"检索索引初始化失败：{exc}")
+                return
+
+        state = self.db.get_search_state()
+        if state["status"] == "ready" and self._index_matches_corpus():
+            return
+        try:
+            self.rebuild_search_index()
+        except ValidationError:
+            # State row is already 'failed'; the portal stays up with search
+            # disabled, and a later restart (or manual rebuild) can recover it.
+            pass
+
+    def _index_matches_corpus(self) -> bool:
+        """Confirm FTS content still mirrors the utterances table.
+
+        An external-content FTS5 index can lose full-text postings while its
+        rowid set and even ``integrity-check`` still look healthy, so three
+        signals are combined: the integrity command, equal row counts, and a
+        functional probe that re-runs a known phrase through MATCH and joins
+        back to the content table. Any failure means a rebuild is required.
+        """
+        try:
+            with self.db.transaction() as conn:
+                conn.execute(
+                    "INSERT INTO utterance_fts(utterance_fts) VALUES('integrity-check')"
+                )
+                corpus = int(
+                    conn.execute("SELECT COUNT(*) AS c FROM utterances").fetchone()["c"]
+                )
+                indexed = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS c FROM utterance_fts"
+                    ).fetchone()["c"]
+                )
+                if corpus != indexed:
+                    return False
+                if corpus == 0:
+                    return True
+                # Functional probe: pick one corpus row, derive a 3-character
+                # probe phrase from its own text, and require MATCH to find it
+                # via the FTS index. A posting that went missing fails here even
+                # when counts and integrity-check disagree with reality.
+                probe = conn.execute(
+                    "SELECT id, text FROM utterances ORDER BY id LIMIT 1"
+                ).fetchone()
+                phrase = self._probe_phrase(probe["text"])
+                if phrase is None:
+                    # Text has no usable 3-char run (e.g. pure short punctuation);
+                    # counts and integrity already agreed, so accept it.
+                    return True
+                hit = conn.execute(
+                    "SELECT 1 FROM utterance_fts "
+                    "JOIN utterances u ON u.id = utterance_fts.rowid "
+                    "WHERE utterance_fts MATCH ? AND u.id = ? LIMIT 1",
+                    (phrase, int(probe["id"])),
+                ).fetchone()
+        except sqlite3.Error:
+            return False
+        return hit is not None
+
+    @staticmethod
+    def _probe_phrase(text: str) -> str | None:
+        cleaned = re.sub(r"\s+", " ", text or "").strip()
+        cleaned = "".join(ch for ch in cleaned if ord(ch) >= 32)
+        if len(cleaned) < MIN_QUERY_CHARS:
+            return None
+        return '"' + cleaned[:MIN_QUERY_CHARS].replace('"', '""') + '"'
+
+    def rebuild_search_index(self) -> dict[str, Any]:
+        """Rebuild the whole FTS index inside one write transaction.
+
+        Either the new index and the ``ready`` state commit together, or
+        everything rolls back to the last good index; a failed build leaves the
+        state as ``failed`` so search reports "retrieval unavailable" rather than
+        serving a partial index. While the build is running its
+        ``BEGIN IMMEDIATE`` lock queues uploads/revocations behind it, so no
+        committed row can be missing once it completes.
+        """
+        if not self._index_lock.acquire(blocking=False):
+            raise ValidationError("检索索引正在构建中，请稍后再试")
+        try:
+            if not self.db.fts_available():
+                try:
+                    self.db.bootstrap_fts()
+                except sqlite3.Error as exc:
+                    self.db.set_search_state(
+                        "failed", error=f"检索索引构建失败：{exc}"
+                    )
+                    raise ValidationError("检索索引构建失败，检索暂不可用") from exc
+
+            self.db.set_search_state("building")
+            try:
+                with self.db.transaction() as conn:
+                    if os.environ.get("PORTAL_FAIL_INDEX_BUILD") == "1":
+                        raise sqlite3.OperationalError(
+                            "模拟索引构建失败（PORTAL_FAIL_INDEX_BUILD=1）"
+                        )
+                    conn.execute(
+                        "INSERT INTO utterance_fts(utterance_fts) VALUES('rebuild')"
+                    )
+                    indexed = int(
+                        conn.execute(
+                            "SELECT COUNT(*) AS c FROM utterance_fts"
+                        ).fetchone()["c"]
+                    )
+                    corpus = int(
+                        conn.execute(
+                            "SELECT COUNT(*) AS c FROM utterances"
+                        ).fetchone()["c"]
+                    )
+                    if indexed != corpus:
+                        raise sqlite3.OperationalError(
+                            "检索索引行数与语料不一致，构建失败"
+                        )
+                self.db.set_search_state("ready", indexed_rows=indexed)
+            except sqlite3.Error as exc:
+                # The transaction rolled back to the previous good index; mark
+                # search unusable anyway so nothing reads an uncertain state.
+                self.db.set_search_state("failed", error=f"检索索引构建失败：{exc}")
+                raise ValidationError("检索索引构建失败，检索暂不可用") from exc
+            return {"indexed_rows": indexed}
+        finally:
+            self._index_lock.release()
+
+    def search_state(self) -> dict[str, Any]:
+        state = self.db.get_search_state()
+        state["available"] = (
+            state["status"] == "ready" and self.db.fts_available()
+        )
+        if state["available"]:
+            # The triggers keep the FTS index aligned row-for-row; report the
+            # live count rather than the snapshot taken at the last rebuild.
+            with self.db.read() as conn:
+                state["indexed_rows"] = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS c FROM utterance_fts"
+                    ).fetchone()["c"]
+                )
+        return state
+
+    def search(
+        self, query: str, batch: str = "", limit: int = SEARCH_LIMIT
+    ) -> dict[str, Any]:
+        """Phrase search over current corpus rows.
+
+        Only a ``ready`` index is ever queried. The query is wrapped as an FTS5
+        phrase so user input cannot inject FTS operators, and trigram
+        tokenization enforces the three-character minimum. Revoked rows were
+        deleted from ``utterances`` (and hence from the FTS index) in the same
+        transaction as the revocation, so they can never match.
+        """
+        state = self.search_state()
+        if not state["available"]:
+            return {
+                "available": False,
+                "query": query,
+                "batch": batch,
+                "error": state.get("error") or "检索索引尚未就绪，检索暂不可用",
+                "results": [],
+                "total": 0,
+            }
+
+        phrase = self._build_phrase(query)
+        if phrase is None:
+            raise ValidationError(
+                f"检索词需为至少 {MIN_QUERY_CHARS} 个字符的连续词句"
+            )
+
+        sql = (
+            "SELECT u.id, u.batch, u.respondent_id, u.text, "
+            "highlight(utterance_fts, 0, '\u0001', '\u0002') AS snippet "
+            "FROM utterance_fts "
+            "JOIN utterances u ON u.id = utterance_fts.rowid "
+            "WHERE utterance_fts MATCH ?"
+        )
+        params: list[Any] = [phrase]
+        batch = (batch or "").strip()
+        if batch:
+            sql += " AND u.batch = ?"
+            params.append(batch)
+        sql += " ORDER BY u.id LIMIT ?"
+        params.append(limit + 1)
+
+        with self.db.read() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        results = []
+        for row in rows[:limit]:
+            results.append(
+                {
+                    "id": row["id"],
+                    "batch": row["batch"],
+                    "respondent_id": row["respondent_id"],
+                    "text": row["text"],
+                    "snippet": self._render_snippet(row["snippet"], row["text"]),
+                }
+            )
+        truncated = len(rows) > limit
+        return {
+            "available": True,
+            "query": query.strip(),
+            "batch": batch,
+            "results": results,
+            "total": len(results) + (1 if truncated else 0),
+            "truncated": truncated,
+            "limit": limit,
+        }
+
+    @staticmethod
+    def _build_phrase(query: str) -> str | None:
+        """Turn free text into a safe FTS5 phrase expression.
+
+        Wrapping the whole query in double quotes makes it a contiguous phrase
+        (matching the "continuous wording" requirement) and neutralises FTS
+        operators; embedded double quotes are doubled per the FTS5 escaping
+        rule. Runs of control/whitespace characters are collapsed to single
+        spaces so spacing differences do not break phrase matching.
+        """
+        cleaned = re.sub(r"\s+", " ", query.replace("\t", " ")).strip()
+        # Drop control characters that cannot occur in real corpus text.
+        cleaned = "".join(ch for ch in cleaned if ord(ch) >= 32)
+        if len(cleaned) < MIN_QUERY_CHARS or len(cleaned) > MAX_QUERY_CHARS:
+            return None
+        return '"' + cleaned.replace('"', '""') + '"'
+
+    @staticmethod
+    def _render_snippet(marked: str | None, fallback: str) -> str:
+        """Convert FTS5 highlight markers into safe HTML <mark> spans."""
+        if not marked:
+            return html.escape(fallback)
+        escaped = html.escape(marked)
+        return (
+            escaped.replace("\u0001", "<mark>")
+            .replace("\u0002", "</mark>")
+        )
 
     # ------------------------------------------------------------------
     # lifecycle

@@ -29,8 +29,7 @@
 
     <div class="grid">
       <section class="card">
-        <h2>1. 上传访谈语料</h2>
-        <p class="hint">CSV 需包含列：<code>batch</code>（访谈批次）、<code>respondent_id</code>（受访者编号）、<code>text</code>（文本）。也接受中文表头：访谈批次 / 受访者编号 / 文本。</p>
+        <h2>1. 上传访谈语料</h2>        <p class="hint">CSV 需包含列：<code>batch</code>（访谈批次）、<code>respondent_id</code>（受访者编号）、<code>text</code>（文本）。也接受中文表头：访谈批次 / 受访者编号 / 文本。</p>
         <form method="post" action="/upload" enctype="multipart/form-data" class="stack">
           <input type="file" name="file" accept=".csv,text/csv">
           <div class="row">
@@ -105,6 +104,80 @@
         <p class="hint small">开关与失败预算保存在 SQLite 中，重启后仍生效；只有关闭开关或点「立即重试清理」才会继续删除。</p>
       </section>
     </div>
+
+    <section class="card wide search-card">
+      <h2>4. 政策术语原话检索</h2>
+      <p class="hint small">
+        按批次检索提到同一政策术语的访谈原话：输入至少 3 个字符的连续词句，可限定单个批次；
+        结果展示匹配原文（高亮命中处）、受访者编号与批次。索引基于 SQLite FTS5，
+        新上传与撤回随语料在同一事务同步。
+      </p>
+
+      {% if not search_state.available %}
+      <div class="flash flash-error search-flash">
+        <span>检索当前不可用：{{ search_state.error or "检索索引尚未就绪" }}。系统不会使用不完整的索引返回结果；可重建索引，或重启服务后自动恢复。</span>
+        <form method="post" action="/search/rebuild" class="inline">
+          <button type="submit" class="btn btn-small btn-ghost">重建检索索引</button>
+        </form>
+      </div>
+      {% endif %}
+
+      <form method="get" action="/search" class="row search-form">
+        <input type="text" name="q" value="{{ search_query or '' }}"
+               minlength="3" maxlength="500" required
+               placeholder="连续词句（至少 3 个字符），例如：乡村振兴战略"
+               class="search-input">
+        <select name="batch">
+          <option value="">全部批次</option>
+          {% for b in batches %}
+          <option value="{{ b.name }}" {% if search_batch == b.name %}selected{% endif %}>
+            {{ b.name }}
+          </option>
+          {% endfor %}
+        </select>
+        <button type="submit" class="btn" {% if not search_state.available %}disabled{% endif %}>检索</button>
+      </form>
+
+      {% if search_result %}
+      <div class="search-meta">
+        检索词「<strong>{{ search_result.query }}</strong>」
+        {% if search_result.batch %}· 批次 {{ search_result.batch }}{% endif %}
+        · 命中 {{ search_result.total }} 条
+        {% if search_result.truncated %}（仅展示前 {{ search_result.limit }} 条，请细化检索词）{% endif %}
+      </div>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>受访者编号</th><th>批次</th><th>匹配原文</th></tr>
+          </thead>
+          <tbody>
+            {% for r in search_result.results %}
+            <tr>
+              <td class="mono">{{ r.respondent_id }}</td>
+              <td>{{ r.batch }}</td>
+              <td class="quote">{{ r.snippet | safe }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="3" class="empty">没有匹配的语料行</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% elif search_query %}
+      <p class="hint">没有匹配的语料行。</p>
+      {% endif %}
+
+      <p class="hint small search-status">
+        索引状态：
+        {% if search_state.status == 'ready' %}
+          <span class="pill pill-ready">可用（已索引 {{ search_state.indexed_rows }} 行）</span>
+        {% elif search_state.status == 'building' %}
+          <span class="pill pill-running">构建中</span>
+        {% else %}
+          <span class="pill pill-failed">构建失败 · 检索不可用</span>
+        {% endif %}
+      </p>
+    </section>
 
     <section class="card wide">
       <h2>生成任务</h2>

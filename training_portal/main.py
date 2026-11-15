@@ -84,6 +84,7 @@ def render(request: Request, template: str, **context: object):
         "settings": portal.db.get_settings(),
         "stats": portal.stats(),
         "pending": portal.pending_cleanup_count(),
+        "search_state": portal.search_state(),
     }
     return templates.TemplateResponse(request, template, {**base, **context})
 
@@ -202,6 +203,63 @@ def cleanup_retry(request: Request):
         return page(request, error=str(exc))
 
 
+@app.get("/search")
+def search_page(
+    request: Request,
+    q: str = "",
+    batch: str = "",
+):
+    query = q.strip()
+    try:
+        result = portal.search(query, batch=batch)
+    except ValidationError as exc:
+        return page(request, error=str(exc), search_query=query, search_batch=batch)
+    if not result["available"]:
+        return page(
+            request,
+            error=result["error"],
+            search_query=query,
+            search_batch=batch,
+        )
+    if not query:
+        return page(request, search_query="", search_batch=batch)
+    return page(
+        request,
+        search_result=result,
+        search_query=query,
+        search_batch=batch,
+    )
+
+
+@app.post("/search/rebuild")
+def search_rebuild(request: Request):
+    try:
+        result = portal.rebuild_search_index()
+        return page(
+            request,
+            notice=f"检索索引已重建，共索引 {result['indexed_rows']} 行语料，检索已恢复。",
+        )
+    except ValidationError as exc:
+        return page(request, error=str(exc))
+
+
+@app.get("/api/search")
+def api_search(q: str = "", batch: str = ""):
+    try:
+        result = portal.search(q.strip(), batch=batch)
+    except ValidationError as exc:
+        return JSONResponse(
+            {"ok": False, "error": str(exc)}, status_code=400
+        )
+    if not result["available"]:
+        return JSONResponse(
+            {"ok": False, "error": result["error"], "results": []},
+            status_code=503,
+        )
+    result["ok"] = True
+    return JSONResponse(result)
+
+
 @app.get("/download/{export_id}")
 def download(export_id: int):
     handle, name, error = portal.open_download(export_id)
@@ -247,6 +305,7 @@ def api_status():
         {
             "stats": portal.stats(),
             "pending": portal.pending_cleanup_count(),
+            "search": portal.search_state(),
             "settings": portal.db.get_settings(),
             "jobs": portal.jobs(limit=20),
             "exports": [
